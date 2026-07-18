@@ -1,25 +1,8 @@
-/*
- * Copyright (C) 2026 Wolfgang Kampichler.
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
- */
-
 #include <fcntl.h>
 #include <ncurses.h>
 #include <pjsua-lib/pjsua.h>
 #include <pthread.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -28,7 +11,7 @@
 #define MAX_SIP_URI 128
 #define BUF_SIZE 512
 
-/* Global Variables */
+// --- Global Variables ---
 WINDOW *win_hist;
 WINDOW *win_log;
 WINDOW *win_remote;
@@ -36,10 +19,11 @@ WINDOW *win_local;
 pthread_mutex_t ui_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 volatile int ui_ready = 0;
+volatile int shutting_down = 0;
 pjsua_call_id current_call = PJSUA_INVALID_ID;
 pjsua_player_id audio_player_id = PJSUA_INVALID_ID;
 
-/* CLI Arguments */
+// CLI Arguments
 int local_port = 5060;
 char dest_uri[MAX_SIP_URI] = {0};
 char public_ip[MAX_SIP_URI] = {0};
@@ -48,13 +32,13 @@ char playback_file[MAX_SIP_URI] = {0};
 int use_cr_only = 0;
 int use_nl_only = 0;
 
-/* Typing Buffers */
+// Typing Buffers
 char remote_buf[BUF_SIZE] = {0};
 int remote_idx = 0;
 char local_buf[BUF_SIZE] = {0};
 int local_idx = 0;
 
-/* UI Helpers */
+// --- UI Helpers ---
 static void draw_borders()
 {
     box(win_remote, 0, 0);
@@ -77,36 +61,39 @@ static void print_hist(const char *fmt, ...)
     va_end(args);
 }
 
-/* PJSIP Log Callback */
+// --- PJSIP Log Callback ---
 static void custom_log_cb(int level, const char *data, int len)
 {
-    /* Fallback to standard output if the UI isn't loaded yet */
+    // Prevent UI tearing: Only use stdout if UI is not active AND we aren't
+    // shutting down.
     if (!ui_ready) {
-        printf("%.*s", len, data);
-        fflush(stdout);
+        if (!shutting_down) {
+            printf("%.*s", len, data);
+            fflush(stdout);
+        }
         return;
     }
+
     pthread_mutex_lock(&ui_mutex);
     wprintw(win_log, "%.*s", len, data);
     wrefresh(win_log);
     pthread_mutex_unlock(&ui_mutex);
 }
 
-/* RTT Transmitter */
+// --- RTT Transmitter ---
 static void send_rtt_chars(const char *str, int len)
 {
     if (current_call == PJSUA_INVALID_ID)
         return;
+
     pjsua_call_send_text_param param;
     pjsua_call_send_text_param_default(&param);
-
-    pj_str_t pj_text;
-    pj_text.ptr = (char *) str;
+    pj_str_t pj_text = pj_str((char *) str);
     pj_text.slen = len;
-
     param.text = pj_text;
 
     pj_status_t status = pjsua_call_send_text(current_call, &param);
+
     if (status != PJ_SUCCESS && ui_ready) {
         pthread_mutex_lock(&ui_mutex);
         wprintw(win_log, "[ERROR] Failed to send RTT text! Code: %d\n", status);
@@ -115,7 +102,7 @@ static void send_rtt_chars(const char *str, int len)
     }
 }
 
-/* SDP Sanitizer */
+// --- SDP Sanitizer (Workaround for PJSIP RTT-RED Bugs) ---
 static void on_call_sdp_created(pjsua_call_id call_id, pjmedia_sdp_session *sdp,
                                 pj_pool_t *pool,
                                 const pjmedia_sdp_session *rem_sdp)
@@ -136,8 +123,7 @@ static void on_call_sdp_created(pjsua_call_id call_id, pjmedia_sdp_session *sdp,
                 if (ui_ready) {
                     print_hist(
                         "\n[SDP FIX] Duplicate m=text detected. Forcing port "
-                        "to 0 "
-                        "to prevent RED negotiation failure.\n");
+                        "to 0 to prevent RED negotiation failure.\n");
                 }
                 m->desc.port = 0;
             }
@@ -145,7 +131,7 @@ static void on_call_sdp_created(pjsua_call_id call_id, pjmedia_sdp_session *sdp,
     }
 }
 
-/* PJSIP Callbacks */
+// --- PJSIP Callbacks ---
 static void on_incoming_call(pjsua_acc_id acc_id, pjsua_call_id call_id,
                              pjsip_rx_data *rdata)
 {
@@ -175,14 +161,13 @@ static void on_call_state(pjsua_call_id call_id, pjsip_event *e)
     }
 }
 
-/* Triggered when RTP (Audio) channels are established */
+// Triggered when RTP (Audio) channels are established
 static void on_call_media_state(pjsua_call_id call_id)
 {
     pjsua_call_info ci;
     pjsua_call_get_info(call_id, &ci);
 
     if (ci.media_status == PJSUA_CALL_MEDIA_ACTIVE) {
-        /* If the user loaded an audio file, route it to the call */
         if (audio_player_id != PJSUA_INVALID_ID) {
             pjsua_conf_connect(pjsua_player_get_conf_port(audio_player_id),
                                ci.conf_slot);
@@ -201,7 +186,6 @@ static void on_call_rx_text(pjsua_call_id call_id,
     pthread_mutex_lock(&ui_mutex);
     for (int i = 0; i < data->text.slen; i++) {
         char c = data->text.ptr[i];
-
         if (c == '\r' || c == '\n') {
             if (remote_idx > 0) {
                 wprintw(win_hist, "Remote: %s\n", remote_buf);
@@ -209,16 +193,8 @@ static void on_call_rx_text(pjsua_call_id call_id,
                 remote_idx = 0;
             }
         } else if (c == '\b' || c == 127 || c == 8) {
-            if (remote_idx > 0) {
-                do {
-                    remote_idx--;
-                    char deleted_byte = remote_buf[remote_idx];
-                    remote_buf[remote_idx] = '\0';
-                    if ((deleted_byte & 0xC0) != 0x80) {
-                        break;
-                    }
-                } while (remote_idx > 0);
-            }
+            if (remote_idx > 0)
+                remote_buf[--remote_idx] = '\0';
         } else {
             if (remote_idx < BUF_SIZE - 2) {
                 remote_buf[remote_idx++] = c;
@@ -226,7 +202,6 @@ static void on_call_rx_text(pjsua_call_id call_id,
             }
         }
     }
-
     werase(win_remote);
     draw_borders();
     mvwprintw(win_remote, 1, 1, "%s", remote_buf);
@@ -235,12 +210,12 @@ static void on_call_rx_text(pjsua_call_id call_id,
     pthread_mutex_unlock(&ui_mutex);
 }
 
-/* Main Application */
+// --- Main Application ---
 int main(int argc, char *argv[])
 {
     pj_status_t status;
 
-    /* Parse CLI Arguments */
+    // Parse CLI Arguments
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
             local_port = atoi(argv[++i]);
@@ -259,7 +234,7 @@ int main(int argc, char *argv[])
         }
     }
 
-    /* Initialize PJSIP */
+    // Initialize PJSIP
     status = pjsua_create();
     if (status != PJ_SUCCESS)
         return 1;
@@ -287,7 +262,7 @@ int main(int argc, char *argv[])
     if (status != PJ_SUCCESS)
         return 1;
 
-    /* Setup TCP Transport */
+    // Setup TCP Transport
     pjsua_transport_config trans_cfg;
     pjsua_transport_config_default(&trans_cfg);
     pjsua_transport_config_default(&rtp_cfg);
@@ -304,7 +279,7 @@ int main(int argc, char *argv[])
     if (status != PJ_SUCCESS)
         return 1;
 
-    /* Setup Local Account */
+    // Setup Local Account
     pjsua_acc_config acc_cfg;
     pjsua_acc_config_default(&acc_cfg);
     acc_cfg.transport_id = tp_id;
@@ -329,7 +304,7 @@ int main(int argc, char *argv[])
     if (status != PJ_SUCCESS)
         return 1;
 
-    /* Initialize Ncurses */
+    // Initialize Ncurses
     initscr();
     cbreak();
     noecho();
@@ -363,7 +338,7 @@ int main(int argc, char *argv[])
 
     ui_ready = 1;
 
-    /* Audio Device Setup (null sound device) */
+    // Audio Device Setup
     status = pjsua_set_null_snd_dev();
     if (status != PJ_SUCCESS) {
         ui_ready = 0;
@@ -371,7 +346,7 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    /* Start PJSUA */
+    // Start PJSIP
     status = pjsua_start();
     if (status != PJ_SUCCESS) {
         ui_ready = 0;
@@ -379,25 +354,23 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    /* Safely load the Audio Player into the newly activated media bridge */
+    // Safely load the Audio Player
     if (strlen(playback_file) > 0) {
         pj_str_t file_path = pj_str(playback_file);
-        /* loop indefinitely */
         status = pjsua_player_create(&file_path, 0, &audio_player_id);
         if (status != PJ_SUCCESS) {
             ui_ready = 0;
             endwin();
             printf(
                 "[FATAL] Could not load audio file. Ensure it is a valid "
-                "16-bit "
-                "PCM WAV.\n");
+                "16-bit PCM WAV.\n");
             return 1;
         }
         print_hist("[SYSTEM] Audio file loaded successfully: %s\n",
                    playback_file);
     }
 
-    /* Calling Logic */
+    // Dialing Logic
     if (strlen(dest_uri) > 0) {
         char safe_uri[256];
         char temp_uri[256];
@@ -432,9 +405,29 @@ int main(int argc, char *argv[])
         print_hist("[UAS] Listening on TCP port %d...\n", local_port);
     }
 
-    /* Input Loop */
+    // Input Loop
     int ch;
-    while ((ch = wgetch(win_local)) != 27) {
+    while (1) {
+        ch = wgetch(win_local);
+
+        if (ch == 27 && !shutting_down) {
+            shutting_down = 1;
+
+            if (current_call != PJSUA_INVALID_ID) {
+                print_hist("\n[SYSTEM] Hanging up call before exit...\n");
+                pjsua_call_hangup_all();
+            } else {
+                break;  // Safe to exit immediately
+            }
+        }
+
+        if (shutting_down) {
+            if (current_call == PJSUA_INVALID_ID) {
+                break;  // Disconnect confirmed, exit gracefully
+            }
+            continue;  // Spin cycle waiting for `on_call_state`
+        }
+
         if (ch == ERR) {
             pthread_mutex_lock(&ui_mutex);
             wrefresh(win_hist);
@@ -445,7 +438,7 @@ int main(int argc, char *argv[])
             continue;
         }
 
-        /* Handle Resizing */
+        // Handle Resizing
         if (ch == KEY_RESIZE) {
             pthread_mutex_lock(&ui_mutex);
             int new_lines, new_cols;
@@ -483,50 +476,65 @@ int main(int argc, char *argv[])
             continue;
         }
 
-        /* Handle Typing */
-        pthread_mutex_lock(&ui_mutex);
+        // Handle Typing
         if (ch == '\n' || ch == '\r') {
             if (local_idx > 0) {
                 char crlf[2] = {'\r', '\n'};
-                if (use_cr_only) {
-                    char cr = '\r';
-                    send_rtt_chars(&cr, 1);
-                } else if (use_nl_only) {
-                    char nl = '\n';
-                    send_rtt_chars(&nl, 1);
-                } else if ((use_cr_only) && (use_nl_only)) {
+
+                // Network operations MUST occur outside the UI mutex lock block
+                if (use_cr_only)
+                    send_rtt_chars("\r", 1);
+                else if (use_nl_only)
+                    send_rtt_chars("\n", 1);
+                else
                     send_rtt_chars(crlf, 2);
-                } else {
-                    send_rtt_chars(crlf, 2);
-                }
+
+                pthread_mutex_lock(&ui_mutex);
                 wprintw(win_hist, "Me: %s\n", local_buf);
                 memset(local_buf, 0, sizeof(local_buf));
                 local_idx = 0;
+
+                werase(win_local);
+                draw_borders();
+                mvwprintw(win_local, 1, 1, "%s", local_buf);
+                wrefresh(win_local);
+                wrefresh(win_hist);
+                pthread_mutex_unlock(&ui_mutex);
             }
         } else if (ch == KEY_BACKSPACE || ch == 127 || ch == '\b') {
             if (local_idx > 0) {
+                send_rtt_chars("\b", 1);
+
+                pthread_mutex_lock(&ui_mutex);
                 local_buf[--local_idx] = '\0';
-                char bs = '\b';
-                send_rtt_chars(&bs, 1);
+                werase(win_local);
+                draw_borders();
+                mvwprintw(win_local, 1, 1, "%s", local_buf);
+                wrefresh(win_local);
+                pthread_mutex_unlock(&ui_mutex);
             }
         } else if (ch >= 32 && ch <= 126) {
             if (local_idx < BUF_SIZE - 2) {
-                local_buf[local_idx++] = (char) ch;
-                local_buf[local_idx] = '\0';
                 char c = (char) ch;
                 send_rtt_chars(&c, 1);
+
+                pthread_mutex_lock(&ui_mutex);
+                local_buf[local_idx++] = c;
+                local_buf[local_idx] = '\0';
+                werase(win_local);
+                draw_borders();
+                mvwprintw(win_local, 1, 1, "%s", local_buf);
+                wrefresh(win_local);
+                pthread_mutex_unlock(&ui_mutex);
             }
         }
-
-        werase(win_local);
-        draw_borders();
-        mvwprintw(win_local, 1, 1, "%s", local_buf);
-        wrefresh(win_local);
-        pthread_mutex_unlock(&ui_mutex);
     }
 
-    /* Shutdown Sequence */
+    // Shutdown Sequence
     ui_ready = 0;
+
+    // ui_ready flag has triggered custom_log_cb to suppress stdout prints
+    // ensuring the console state isn't ruined before we invoke endwin()
 
     if (audio_player_id != PJSUA_INVALID_ID) {
         pjsua_player_destroy(audio_player_id);

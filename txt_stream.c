@@ -914,6 +914,7 @@ static pj_status_t send_text_locked(pjmedia_txt_stream *stream,
                       deferred_char_len);
             rtp_ts_len = 10;
         }
+        stream->tx_last_ts = now;
     }
 
     return status;
